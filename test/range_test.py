@@ -22,8 +22,9 @@ from helpers import unittest, LuigiTestCase
 import luigi
 import mock
 from luigi.mock import MockTarget, MockFileSystem
-from luigi.tools.range import (RangeDaily, RangeDailyBase, RangeEvent, RangeHourly, RangeHourlyBase, _constrain_glob,
-                               _get_filesystems_and_globs)
+from luigi.tools.range import (RangeDaily, RangeDailyBase, RangeEvent, 
+    RangeHourly, RangeHourlyBase, RangeMonthly, RangeMonthlyBase, 
+    _constrain_glob, _get_filesystems_and_globs)
 
 
 class CommonDateHourTask(luigi.Task):
@@ -38,6 +39,13 @@ class CommonDateTask(luigi.Task):
 
     def output(self):
         return MockTarget(self.d.strftime('/n2000y01a05n/%Y_%m-_-%daww/21mm01dara21/ooo'))
+
+
+class CommonMonthTask(luigi.Task):
+    d = luigi.MonthParameter()
+
+    def output(self):
+        return MockTarget(self.d.strftime('/n2000y01a05n/%Y_%m-_-aww/21mm01dara21/ooo'))
 
 
 task_a_paths = [
@@ -461,6 +469,123 @@ class RangeHourlyBaseTest(unittest.TestCase):
                 ],
                 'event.tools.range.complete.fraction': [
                     ('CommonDateHourTask', 84061. / (84061 + 7)),
+                ],
+            }
+        )
+
+
+class RangeMonthlyBaseTest(unittest.TestCase):
+    maxDiff = None
+
+    def setUp(self):
+        # yucky to create separate callbacks; would be nicer if the callback
+        # received an instance of a subclass of Event, so one callback could
+        # accumulate all types
+        @RangeMonthlyBase.event_handler(RangeEvent.DELAY)
+        def callback_delay(*args):
+            self.events.setdefault(RangeEvent.DELAY, []).append(args)
+
+        @RangeMonthlyBase.event_handler(RangeEvent.COMPLETE_COUNT)
+        def callback_complete_count(*args):
+            self.events.setdefault(RangeEvent.COMPLETE_COUNT, []).append(args)
+
+        @RangeMonthlyBase.event_handler(RangeEvent.COMPLETE_FRACTION)
+        def callback_complete_fraction(*args):
+            self.events.setdefault(RangeEvent.COMPLETE_FRACTION, []).append(args)
+
+        self.events = {}
+
+    def test_consistent_formatting(self):
+        task = RangeMonthlyBase(of=CommonMonthTask,
+                              start=datetime.date(2016, 1, 1))
+        self.assertEqual(task._format_range([datetime.datetime(2016, 1, 2, 13), datetime.datetime(2016, 2, 29, 23)]), '[2016-01-01, 2016-02-01]')
+
+    def _empty_subcase(self, kwargs, expected_events):
+        calls = []
+
+        class RangeMonthlyDerived(RangeMonthlyBase):
+            def missing_datetimes(self, task_cls, finite_datetimes):
+                args = [self, task_cls, finite_datetimes]
+                calls.append(args)
+                return args[-1][:5]
+
+        task = RangeMonthlyDerived(of=CommonDateTask,
+                                 **kwargs)
+        self.assertEqual(task.requires(), [])
+        self.assertEqual(calls, [])
+        self.assertEqual(task.requires(), [])
+        self.assertEqual(calls, [])  # subsequent requires() should return the cached result, never call missing_datetimes
+        self.assertEqual(self.events, expected_events)
+        self.assertTrue(task.complete())
+
+    def test_stop_before_months_back(self):
+        # nothing to do because stop is earlier
+        self._empty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(2015, 1, 1, 4)),
+                'stop': datetime.date(2014, 3, 20),
+                'months_back': 4,
+                'months_forward': 20,
+                'reverse': True,
+            },
+            {
+                'event.tools.range.delay': [
+                    ('CommonDateTask', 0),
+                ],
+                'event.tools.range.complete.count': [
+                    ('CommonDateTask', 0),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonDateTask', 1.),
+                ],
+            }
+        )
+
+    def _nonempty_subcase(self, kwargs, expected_finite_datetimes_range, expected_requires, expected_events):
+        calls = []
+
+        class RangeMonthlyDerived(RangeMonthlyBase):
+            def missing_datetimes(self, finite_datetimes):
+                # I only changed tests for number of arguments at this one
+                # place to test both old and new behavior
+                calls.append((self, finite_datetimes))
+                return finite_datetimes[:7]
+
+        task = RangeMonthlyDerived(of=CommonMonthTask,
+                                 **kwargs)
+        self.assertEqual(list(map(str, task.requires())), expected_requires)
+        self.assertEqual((min(calls[0][1]), max(calls[0][1])), expected_finite_datetimes_range)
+        self.assertEqual(list(map(str, task.requires())), expected_requires)
+        self.assertEqual(len(calls), 1)  # subsequent requires() should return the cached result, not call missing_datetimes again
+        self.assertEqual(self.events, expected_events)
+        self.assertFalse(task.complete())
+
+    def test_start_long_before_long_days_back_and_with_long_days_forward(self):
+        self._nonempty_subcase(
+            {
+                'now': datetime_to_epoch(datetime.datetime(2017, 10, 22, 12, 4, 29)),
+                'start': datetime.date(2011, 3, 20),
+                'stop': datetime.date(2025, 1, 29),
+                'task_limit': 4,
+                'months_back': 3 * 12,
+                'months_forward': 3 * 12,
+            },
+            (datetime.datetime(2014, 10, 24), datetime.datetime(2020, 10, 21)),
+            [
+                'CommonMonthTask(d=2014-10-24)',
+                'CommonMonthTask(d=2014-10-25)',
+                'CommonMonthTask(d=2014-10-26)',
+                'CommonMonthTask(d=2014-10-27)',
+            ],
+            {
+                'event.tools.range.delay': [
+                    ('CommonMonthTask', 3750),
+                ],
+                'event.tools.range.complete.count': [
+                    ('CommonMonthTask', 5057),
+                ],
+                'event.tools.range.complete.fraction': [
+                    ('CommonMonthTask', 5057. / (5057 + 7)),
                 ],
             }
         )

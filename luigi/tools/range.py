@@ -33,6 +33,7 @@ import operator
 import re
 import time
 from datetime import datetime, timedelta
+from dateutil.relativedelta import relativedelta
 
 from luigi import six
 
@@ -402,6 +403,68 @@ class RangeHourlyBase(RangeBase):
         return luigi.DateHourParameter().serialize(dt)
 
 
+class RangeMonthlyBase(RangeBase):
+    """
+    Produces a contiguous completed range of a daily recurring task.
+    """
+    start = luigi.MonthParameter(
+        default=None,
+        description="beginning date, inclusive. Default: None - work backward forever (requires reverse=True)")
+    stop = luigi.MonthParameter(
+        default=None,
+        description="ending date, exclusive. Default: None - work forward forever")
+    months_back = luigi.IntParameter(
+        default=3, 
+        description=("extent to which contiguousness is to be assured into "
+                     "past, in months from current time. Prevents infinite "
+                     "loop when start is none. If the dataset has limited "
+                     "retention (i.e. old outputs get removed), this should "
+                     "be set shorter to that, too, to prevent the oldest "
+                     "ouputs flapping. Increase freely if you intend to "
+                     "process old dates - worker's memory is the limit"))
+    months_forward = luigi.IntParameter(
+        default=0,
+        description="extent to which contiguousness is to be assured into future, in months from current time. Prevents infinite loop when stop is none")
+
+    def datetime_to_parameter(self, dt):
+        return dt.date(dt.year, dt.month, 1)
+
+    def parameter_to_datetime(self, p):
+        return datetime(p.year, p.month, 1)
+
+    def datetime_to_parameters(self, dt):
+        """
+        Given a date-time, will produce a dictionary of of-params combined with the ranged task parameter
+        """
+        return self._task_parameters(dt.date(dt.year, dt.month, 1))
+
+    def parameters_to_datetime(self, p):
+        """
+        Given a dictionary of parameters, will extract the ranged task parameter value
+        """
+        dt = p[self._param_name]
+        return datetime(dt.year, dt.month, 1)
+
+    def moving_start(self, now):
+        return now - relativedelta(months=self.months_back)
+
+    def moving_stop(self, now):
+        return now + relativedelta(months=self.months_forward)
+
+    def finite_datetimes(self, finite_start, finite_stop):
+        """
+        Simply returns the points in time that correspond to turn of day.
+        """
+        date_start = datetime(finite_start.year, finite_start.month, 1)
+        dates = []
+        for i in itertools.count():
+            t = date_start + relativedelta(months=i)
+            if t >= finite_stop:
+                return dates
+            if t >= finite_start:
+                dates.append(t)
+
+
 def _constrain_glob(glob, paths, limit=5):
     """
     Tweaks glob into a list of more specific globs that together still cover paths and not too much extra.
@@ -613,3 +676,29 @@ class RangeHourly(RangeHourlyBase):
                 finite_datetimes,
                 lambda d: self._instantiate_task_cls(self.datetime_to_parameter(d)),
                 lambda d: d.strftime('(%Y).*(%m).*(%d).*(%H)'))
+
+
+class RangeMonthly(RangeMonthlyBase):
+    """Efficiently produces a contiguous completed range of a monthly recurring
+    task that takes a single MonthParameter.
+
+    Falls back to infer it from output filesystem listing to facilitate the
+    common case usage.
+
+    Convenient to use even from command line, like:
+
+    .. code-block:: console
+
+        luigi --module your.module RangeMonthly --of YourActualTask --start 2014-01
+    """
+
+    def missing_datetimes(self, finite_datetimes):
+        try:
+            cls_with_params = functools.partial(self.of, **self.of_params)
+            complete_parameters = self.of.bulk_complete.__func__(cls_with_params, map(self.datetime_to_parameter, finite_datetimes))
+            return set(finite_datetimes) - set(map(self.parameter_to_datetime, complete_parameters))
+        except NotImplementedError:
+            return infer_bulk_complete_from_fs(
+                finite_datetimes,
+                lambda d: self._instantiate_task_cls(self.datetime_to_parameter(d)),
+                lambda d: d.strftime('(%Y).*(%m)'))
